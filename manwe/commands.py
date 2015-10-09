@@ -12,9 +12,12 @@ Todo: Move some of the docstring from the _old_population_study.py file here.
 
 import argparse
 import getpass
+import itertools
 import os
 import re
 import sys
+
+from clint import textui
 
 from .config import Config
 from .errors import (ApiError, BadRequestError, UnauthorizedError,
@@ -42,6 +45,15 @@ def abort(message=None):
     if message:
         log('error: %s' % message)
     sys.exit(1)
+
+
+def wait_for_tasks(*tasks):
+    with textui.progress.Bar(expected_size=100) as bar:
+        for percentages in itertools.izip_longest(
+                *[task.wait_and_monitor() for task in tasks], fillvalue=100):
+            # We treat the `None` percentage (waiting) as `0` (running).
+            bar.show(sum(percentage for percentage in percentages
+                         if percentage is not None) // len(tasks))
 
 
 def list_samples(session, public=False, user=None, groups=None):
@@ -97,12 +109,24 @@ def show_sample(session, uri):
     for variation in session.variations(sample=sample):
         print
         print 'Variation:   %s' % variation.uri
-        print 'State:       %s' % ('imported' if variation.task['done'] else 'not imported')
+        task = variation.task
+        if task.running:
+            print 'Task state:  %s (%d%%)' % (task.state, task.progress)
+        else:
+            print 'Task state:  %s' % task.state
+        if task.failure:
+            print 'Task error:  %s' % task.error.message
 
     for coverage in session.coverages(sample=sample):
         print
         print 'Coverage:    %s' % coverage.uri
-        print 'State:       %s' % ('imported' if coverage.task['done'] else 'not imported')
+        task = coverage.task
+        if task.running:
+            print 'Task state:  %s (%d%%)' % (task.state, task.progress)
+        else:
+            print 'Task state:  %s' % task.state
+        if task.failure:
+            print 'Task error:  %s' % task.error.message
 
 
 def activate_sample(session, uri):
@@ -120,7 +144,7 @@ def activate_sample(session, uri):
     log('Activated sample: %s' % sample.uri)
 
 
-def annotate_sample_variations(session, uri, queries=None):
+def annotate_sample_variations(session, uri, queries=None, wait=False):
     """
     Annotate sample variations with variant frequencies.
     """
@@ -131,10 +155,19 @@ def annotate_sample_variations(session, uri, queries=None):
     except NotFoundError:
         raise UserError('Sample does not exist: "%s"' % uri)
 
+    tasks = []
+
     for variation in session.variations(sample=sample):
         annotation = session.create_annotation(
             variation.data_source, queries=queries)
         log('Started annotation: %s' % annotation.uri)
+        tasks.append(annotation.task)
+
+    if not wait:
+        return
+
+    wait_for_tasks(*tasks)
+    log('Annotated variations for sample: %s' % sample.uri)
 
 
 def add_sample(session, name, groups=None, pool_size=1, public=False,
@@ -158,7 +191,8 @@ def add_sample(session, name, groups=None, pool_size=1, public=False,
 
 def import_sample(session, name, groups=None, pool_size=1, public=False,
                   no_coverage_profile=False, vcf_files=None, bed_files=None,
-                  data_uploaded=False, prefer_genotype_likelihoods=False):
+                  data_uploaded=False, prefer_genotype_likelihoods=False,
+                  wait=False):
     """
     Add sample and import variation and coverage files.
     """
@@ -179,6 +213,8 @@ def import_sample(session, name, groups=None, pool_size=1, public=False,
     sample = add_sample(session, name, groups=groups, pool_size=pool_size,
                         public=public, no_coverage_profile=no_coverage_profile)
 
+    tasks = []
+
     for source, filename in vcf_sources:
         data_source = session.create_data_source(
             'Variants from file "%s"' % filename,
@@ -190,6 +226,7 @@ def import_sample(session, name, groups=None, pool_size=1, public=False,
             sample, data_source,
             prefer_genotype_likelihoods=prefer_genotype_likelihoods)
         log('Started variation import: %s' % variation.uri)
+        tasks.append(variation.task)
 
     for source, filename in bed_sources:
         data_source = session.create_data_source(
@@ -200,10 +237,17 @@ def import_sample(session, name, groups=None, pool_size=1, public=False,
         log('Added data source: %s' % data_source.uri)
         coverage = session.create_coverage(sample, data_source)
         log('Started coverage import: %s' % coverage.uri)
+        tasks.append(coverage.task)
+
+    if not wait:
+        return
+
+    wait_for_tasks(*tasks)
+    log('Imported variations and coverages for sample: %s' % sample.uri)
 
 
 def import_variation(session, uri, vcf_file, data_uploaded=False,
-                     prefer_genotype_likelihoods=False):
+                     prefer_genotype_likelihoods=False, wait=False):
     """
     Import variation file for existing sample.
     """
@@ -224,13 +268,20 @@ def import_variation(session, uri, vcf_file, data_uploaded=False,
         gzipped=vcf_file.endswith('.gz'),
         **source)
     log('Added data source: %s' % data_source.uri)
+
     variation = session.create_variation(
         sample, data_source,
         prefer_genotype_likelihoods=prefer_genotype_likelihoods)
     log('Started variation import: %s' % variation.uri)
 
+    if not wait:
+        return
 
-def import_coverage(session, uri, bed_file, data_uploaded=False):
+    wait_for_tasks(variation.task)
+    log('Imported variation: %s' % variation.uri)
+
+
+def import_coverage(session, uri, bed_file, data_uploaded=False, wait=False):
     """
     Import coverage file for existing sample.
     """
@@ -251,8 +302,15 @@ def import_coverage(session, uri, bed_file, data_uploaded=False):
         gzipped=bed_file.endswith('.gz'),
         **source)
     log('Added data source: %s' % data_source.uri)
+
     coverage = session.create_coverage(sample, data_source)
     log('Started coverage import: %s' % coverage.uri)
+
+    if not wait:
+        return
+
+    wait_for_tasks(coverage.task)
+    log('Imported coverage: %s' % coverage.uri)
 
 
 def list_groups(session):
@@ -389,7 +447,7 @@ def data_source_data(session, uri):
         sys.stdout.write(chunk)
 
 
-def annotate_data_source(session, uri, queries=None):
+def annotate_data_source(session, uri, queries=None, wait=False):
     """
     Annotate data source with variant frequencies.
     """
@@ -404,8 +462,15 @@ def annotate_data_source(session, uri, queries=None):
         data_source, queries=queries)
     log('Started annotation: %s' % annotation.uri)
 
+    if not wait:
+        return
 
-def annotate_vcf(session, vcf_file, data_uploaded=False, queries=None):
+    wait_for_tasks(annotation.task)
+    log('Annotated data source: %s' % annotation.annotated_data_source.uri)
+
+
+def annotate_vcf(session, vcf_file, data_uploaded=False, queries=None,
+                 wait=False):
     """
     Annotate VCF file with variant frequencies.
     """
@@ -423,12 +488,20 @@ def annotate_vcf(session, vcf_file, data_uploaded=False, queries=None):
         gzipped=vcf_file.endswith('.gz'),
         **source)
     log('Added data source: %s' % data_source.uri)
+
     annotation = session.create_annotation(
         data_source, queries=queries)
     log('Started annotation: %s' % annotation.uri)
 
+    if not wait:
+        return
 
-def annotate_bed(session, bed_file, data_uploaded=False, queries=None):
+    wait_for_tasks(annotation.task)
+    log('Annotated VCF file: %s' % annotation.annotated_data_source.uri)
+
+
+def annotate_bed(session, bed_file, data_uploaded=False, queries=None,
+                 wait=False):
     """
     Annotate BED file with variant frequencies.
     """
@@ -446,9 +519,16 @@ def annotate_bed(session, bed_file, data_uploaded=False, queries=None):
         gzipped=bed_file.endswith('.gz'),
         **source)
     log('Added data source: %s' % data_source.uri)
+
     annotation = session.create_annotation(
         data_source, queries=queries)
     log('Started annotation: %s' % annotation.uri)
+
+    if not wait:
+        return
+
+    wait_for_tasks(annotation.task)
+    log('Annotated BED file: %s' % annotation.annotated_data_source.uri)
 
 
 def create_config(filename=None):
@@ -579,6 +659,9 @@ def main():
         '-q', '--query', dest='queries', nargs=2, action=UpdateAction,
         metavar=('NAME', 'EXPRESSION'), help='annotation query (more than '
         'one allowed)')
+    p.add_argument(
+        '-w', '--wait', dest='wait', action='store_true',
+        help='wait for annotations to complete (blocking)')
 
     # Subparser 'samples add'.
     p = s.add_parser(
@@ -640,6 +723,9 @@ def main():
         action='store_true', help='in VCF files, derive genotypes from '
         'likelihood scores instead of using reported genotypes (use this if '
         'the file was produced by samtools)')
+    p.add_argument(
+        '-w', '--wait', dest='wait', action='store_true',
+        help='wait for imports to complete (blocking)')
 
     # Subparser 'samples import-vcf'.
     p = s.add_parser(
@@ -660,6 +746,9 @@ def main():
         action='store_true', help='in VCF files, derive genotypes from '
         'likelihood scores instead of using reported genotypes (use this if '
         'the file was produced by samtools)')
+    p.add_argument(
+        '-w', '--wait', dest='wait', action='store_true',
+        help='wait for import to complete (blocking)')
 
     # Subparser 'samples import-bed'.
     p = s.add_parser(
@@ -675,6 +764,9 @@ def main():
     p.add_argument(
         '-u', '--data-uploaded', dest='data_uploaded', action='store_true',
         help='data files are already uploaded to the server')
+    p.add_argument(
+        '-w', '--wait', dest='wait', action='store_true',
+        help='wait for import to complete (blocking)')
 
     # Subparsers for 'groups'.
     s = subparsers.add_parser(
@@ -788,6 +880,9 @@ def main():
         '-q', '--query', dest='queries', nargs=2, action=UpdateAction,
         metavar=('NAME', 'EXPRESSION'), help='annotation query (more than '
         'one allowed)')
+    p.add_argument(
+        '-w', '--wait', dest='wait', action='store_true',
+        help='wait for annotation to complete (blocking)')
 
     # Subparser 'annotate-vcf'.
     p = subparsers.add_parser(
@@ -804,6 +899,12 @@ def main():
         '-q', '--query', dest='queries', nargs=2, action=UpdateAction,
         metavar=('NAME', 'EXPRESSION'), help='annotation query (more than '
         'one allowed)')
+    # TODO:
+    # - Perhaps --no-wait is better (i.e., wait by default)?
+    # - If we are waiting we might as well also download the result.
+    p.add_argument(
+        '-w', '--wait', dest='wait', action='store_true',
+        help='wait for annotation to complete (blocking)')
 
     # Subparser 'annotate-bed'.
     p = subparsers.add_parser(
@@ -820,6 +921,9 @@ def main():
         '-q', '--query', dest='queries', nargs=2, action=UpdateAction,
         metavar=('NAME', 'EXPRESSION'), help='annotation query (more than '
         'one allowed)')
+    p.add_argument(
+        '-w', '--wait', dest='wait', action='store_true',
+        help='wait for annotation to complete (blocking)')
 
     args = parser.parse_args()
 
